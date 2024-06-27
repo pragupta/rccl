@@ -5,6 +5,8 @@ import time
 import argparse
 import statistics
 
+from rpdTracerControl import rpdTracerControl
+
 def init_process(rank, size, fn, backend='nccl'):
     """ Init the distributed environment. """
     os.environ['MASTER_ADDR'] = '127.0.0.1'
@@ -12,6 +14,7 @@ def init_process(rank, size, fn, backend='nccl'):
     os.environ['RANK'] = str(rank)
     os.environ['WORLD_SIZE'] = str(size)
 
+    torch.cuda.set_device(rank)
     dist.init_process_group(backend, rank=rank, world_size=size)
     return fn(rank, size)
 
@@ -26,8 +29,8 @@ def get_algo_type(data_size):
 def benchmark_all_reduce(rank, size, sequence_lengths, dim, all_reduce_algos, tracing):
     """ Benchmark all-reduce operation - 4 different datasizes will be benched per run """
     torch.cuda.set_device(rank)
-
-    n_runs = 1000
+    torch.cuda.synchronize()
+    n_runs = 5
 
     results = []
 
@@ -39,25 +42,37 @@ def benchmark_all_reduce(rank, size, sequence_lengths, dim, all_reduce_algos, tr
         4: (lambda _: (1, 2, dim))
     }
 
+#    ############ PROFILING ##################
+    profile = rpdTracerControl()
+    profile.start()
+    nvtx = torch.autograd.profiler.emit_nvtx(record_shapes=True)
+    nvtx.__enter__()
+#    ############ PROFILING ##################
+#
     for seq_len in sequence_lengths:
         for algo in all_reduce_algos:
             shape = algo_shapes[algo](seq_len)
             main_times = []
             tensor = torch.randn(*shape, device='cuda').to(torch.bfloat16)
 
-            # Warm-up - before result collection 
+            torch.cuda.nvtx.range_push("warmup")
+            # Warm-up - before result collection
             for _ in range(5):
                 dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
                 dist.barrier()
+            torch.cuda.nvtx.range_pop()
 
-            # Benchmark - result collection and timers disabled if --tracing applied 
-            for _ in range(n_runs):
-                if not tracing: 
+
+#            # Benchmark - result collection and timers disabled if --tracing applied
+            for i in range(n_runs):
+                if not tracing:
                     start = time.time()
 
+                torch.cuda.nvtx.range_push(f"allreuce_{i}")
                 dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
                 dist.barrier()
-                
+                torch.cuda.nvtx.range_pop()
+
                 if not tracing:
                     end = time.time()
                     main_time = (end - start) * 1e6  # Convert to microseconds
@@ -74,6 +89,10 @@ def benchmark_all_reduce(rank, size, sequence_lengths, dim, all_reduce_algos, tr
                 algo_type = get_algo_type(data_size_bytes)
                 results.append([f"all_reduce_{algo}", seq_len, data_size_mb, algo_type, mean_time, median_time, max_time, min_time, std_time])
 
+#    ############ PROFILING ##################
+    nvtx.__exit__(None, None, None)
+    profile.stop()
+#    ############ PROFILING ##################
     return results if rank == 0 and not tracing else None
 
 def main():
