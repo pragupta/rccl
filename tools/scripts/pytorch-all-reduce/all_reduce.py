@@ -16,6 +16,7 @@ def init_process(rank, size, fn, backend='nccl'):
 
     torch.cuda.set_device(rank)
     dist.init_process_group(backend, rank=rank, world_size=size)
+    dist.barrier()
     return fn(rank, size)
 
 def get_algo_type(data_size):
@@ -30,7 +31,7 @@ def benchmark_all_reduce(rank, size, sequence_lengths, dim, all_reduce_algos, tr
     """ Benchmark all-reduce operation - 4 different datasizes will be benched per run """
     torch.cuda.set_device(rank)
     torch.cuda.synchronize()
-    n_runs = 5
+    n_runs = 50
 
     results = []
 
@@ -43,10 +44,12 @@ def benchmark_all_reduce(rank, size, sequence_lengths, dim, all_reduce_algos, tr
     }
 
 #    ############ PROFILING ##################
+#    rpdTracerControl.skipCreate()
+#    rpdTracerControl.skipLoad()
     profile = rpdTracerControl()
     profile.start()
-    nvtx = torch.autograd.profiler.emit_nvtx(record_shapes=True)
-    nvtx.__enter__()
+#    nvtx = torch.autograd.profiler.emit_nvtx(record_shapes=True)
+#    nvtx.__enter__()
 #    ############ PROFILING ##################
 #
     for seq_len in sequence_lengths:
@@ -55,42 +58,59 @@ def benchmark_all_reduce(rank, size, sequence_lengths, dim, all_reduce_algos, tr
             main_times = []
             tensor = torch.randn(*shape, device='cuda').to(torch.bfloat16)
 
-            torch.cuda.nvtx.range_push("warmup")
             # Warm-up - before result collection
-            for _ in range(5):
+            profile.rangePush("", "all_reduce warmup", "")
+            for i in range(5):
                 dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-                dist.barrier()
-            torch.cuda.nvtx.range_pop()
+            profile.rangePop()
+            torch.cuda.synchronize()
+
+            profile.rangePush("", "graph creation", "")
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            profile.rangePop()
+            torch.cuda.synchronize()
+
+            # Warm-up - before result collection
+            profile.rangePush("", "cudagraph warmup", "")
+            for i in range(5):
+                graph.replay()
+            profile.rangePop()
+            torch.cuda.synchronize()
 
 
-#            # Benchmark - result collection and timers disabled if --tracing applied
+##            # Benchmark - result collection and timers disabled if --tracing applied
+            profile.rangePush('', 'allreuce', "")
             for i in range(n_runs):
-                if not tracing:
-                    start = time.time()
-
-                torch.cuda.nvtx.range_push(f"allreuce_{i}")
-                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-                dist.barrier()
-                torch.cuda.nvtx.range_pop()
-
-                if not tracing:
-                    end = time.time()
-                    main_time = (end - start) * 1e6  # Convert to microseconds
-                    main_times.append(main_time)
-
-            if rank == 0 and not tracing:
-                mean_time = statistics.mean(main_times)
-                median_time = statistics.median(main_times)
-                max_time = max(main_times)
-                min_time = min(main_times)
-                std_time = statistics.stdev(main_times)
-                data_size_bytes = torch.tensor(shape).prod().item() * 2  # * 2 as bfloat16 takes 2 bytes
-                data_size_mb = data_size_bytes / (1024 ** 2)
-                algo_type = get_algo_type(data_size_bytes)
-                results.append([f"all_reduce_{algo}", seq_len, data_size_mb, algo_type, mean_time, median_time, max_time, min_time, std_time])
-
+#                if not tracing:
+#                    start = time.time()
+#
+                graph.replay()
+            profile.rangePop()
+            torch.cuda.synchronize()
+##                profile.range_push(f"barrier_{i}")
+#                dist.barrier()
+##                profile.range_pop()
+#
+#                if not tracing:
+#                    end = time.time()
+#                    main_time = (end - start) * 1e6  # Convert to microseconds
+#                    main_times.append(main_time)
+#
+#            if rank == 0 and not tracing:
+#                mean_time = statistics.mean(main_times)
+#                median_time = statistics.median(main_times)
+#                max_time = max(main_times)
+#                min_time = min(main_times)
+#                std_time = statistics.stdev(main_times)
+#                data_size_bytes = torch.tensor(shape).prod().item() * 2  # * 2 as bfloat16 takes 2 bytes
+#                data_size_mb = data_size_bytes / (1024 ** 2)
+#                algo_type = get_algo_type(data_size_bytes)
+#                results.append([f"all_reduce_{algo}", seq_len, data_size_mb, algo_type, mean_time, median_time, max_time, min_time, std_time])
+#
 #    ############ PROFILING ##################
-    nvtx.__exit__(None, None, None)
+#    nvtx.__exit__(None, None, None)
     profile.stop()
 #    ############ PROFILING ##################
     return results if rank == 0 and not tracing else None
